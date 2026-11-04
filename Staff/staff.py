@@ -655,13 +655,6 @@ class StaffAssetManagementApp(tk.Tk):
         self.inventory_category_combo.pack(side="left", padx=(20, 10), ipady=5)
         self.inventory_category_combo.bind("<<ComboboxSelected>>", lambda event: self.apply_inventory_filters())
 
-        export_btn = tk.Button(
-            controls_frame, text="Export CSV", font=("Arial", 10, "bold"), 
-            bg=THEME["bg_header"], fg="white", bd=0, padx=15, pady=5,
-            command=self.handle_staff_export
-        )
-        export_btn.pack(side="right")
-
         tk.Button(
             controls_frame, text="Move to Bin", font=("Arial", 10, "bold"),
             bg=THEME["accent_danger"], fg="white", bd=0, padx=15, pady=5,
@@ -1262,10 +1255,6 @@ class StaffAssetManagementApp(tk.Tk):
                 "login.py",
             )
             subprocess.Popen([sys.executable, login_script], cwd=os.path.dirname(login_script))
-
-    def handle_staff_export(self):
-        if messagebox.askyesno("Confirm Export", "Are you sure you want to export the inventory to CSV?"):
-            messagebox.showinfo("Export Notice", "No records available in inventory to export.")
 
     def validate_qty(self, P):
         if P == "" or P.isdigit():

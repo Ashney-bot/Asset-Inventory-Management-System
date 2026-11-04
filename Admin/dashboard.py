@@ -1,9 +1,11 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 import math
 import os
 import sys
 import subprocess
+import shutil
+import csv
 from datetime import datetime
 import calendar
 import mysql.connector
@@ -835,9 +837,16 @@ class AssetManagementApp(tk.Tk):
 
         import_btn = tk.Button(
             bottom_frame, text="Import CSV", font=("Arial", 10, "bold"), 
-            bg=THEME["bg_header"], fg="white", bd=0, padx=15, pady=5
+            bg=THEME["bg_header"], fg="white", bd=0, padx=15, pady=5,
+            command=self.import_inventory_csv
         )
         import_btn.pack(side="right")
+
+        tk.Button(
+            bottom_frame, text="Export CSV", font=("Arial", 10, "bold"),
+            bg=THEME["bg_header"], fg="white", bd=0, padx=15, pady=5,
+            command=self.export_inventory_csv
+        ).pack(side="right", padx=(0, 10))
         self.load_inventory()
 
     def load_inventory(self):
@@ -1637,11 +1646,48 @@ class AssetManagementApp(tk.Tk):
         card_inner = tk.Frame(card_status, bg=THEME["sub_card"])
         card_inner.pack(fill="x", padx=20, pady=20)
 
+        total_records = 0
+        database_size_kb = 0.0
+        table_count = 0
+        connection = None
+        cursor = None
+        try:
+            connection = mysql.connector.connect(**DB_CONFIG)
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = %s
+                """,
+                (DB_CONFIG["database"],),
+            )
+            table_count = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(table_rows), 0),
+                       COALESCE(SUM(data_length + index_length), 0)
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                """,
+                (DB_CONFIG["database"],),
+            )
+            total_records, database_size_bytes = cursor.fetchone()
+            database_size_kb = database_size_bytes / 1024
+        except Error as exc:
+            table_count = 0
+            print(f"Could not load database status: {exc}")
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None and connection.is_connected():
+                connection.close()
+
         metrics = [
-            ("Total Records:", "0 Entries"),
-            ("Backup Database Size:", "0.0 KB"),
+            ("Database Tables:", f"{table_count} Tables"),
+            ("Estimated Records:", f"{total_records:,} Rows"),
+            ("Database Storage:", f"{database_size_kb:,.1f} KB"),
             ("Last Backup:", "None Recorded"),
-            ("Daily Backup:", "Active (Runs at 00:00 Daily)")
+            ("Daily Backup:", "Manual Export (Not Scheduled)")
         ]
         
         for label, val in metrics:
@@ -1898,8 +1944,312 @@ class AssetManagementApp(tk.Tk):
             subprocess.Popen([sys.executable, login_script], cwd=os.path.dirname(login_script))
 
     def handle_export(self):
-        if messagebox.askyesno("Confirm Export", "Are you sure you want to export the SQL database backup?"):
-            messagebox.showinfo("Export Notice", "No records available in database to export.")
+        if not messagebox.askyesno(
+            "Confirm Export",
+            "Export the complete asset inventory database to a SQL file?",
+        ):
+            return
+
+        default_name = f"{DB_CONFIG['database']}_backup_{datetime.now():%Y%m%d_%H%M%S}.sql"
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save SQL Database Backup",
+            initialfile=default_name.replace(" ", "_"),
+            defaultextension=".sql",
+            filetypes=[("SQL files", "*.sql"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        mysqldump = shutil.which("mysqldump")
+        if mysqldump:
+            try:
+                command = [
+                    mysqldump,
+                    f"--host={DB_CONFIG['host']}",
+                    f"--user={DB_CONFIG['user']}",
+                    "--single-transaction",
+                    "--routines",
+                    "--events",
+                    "--triggers",
+                    "--result-file",
+                    file_path,
+                    DB_CONFIG["database"],
+                ]
+                dump_environment = os.environ.copy()
+                if DB_CONFIG["password"]:
+                    dump_environment["MYSQL_PWD"] = DB_CONFIG["password"]
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=dump_environment,
+                )
+                messagebox.showinfo(
+                    "Export Complete",
+                    f"SQL database backup created successfully:\n{file_path}",
+                    parent=self,
+                )
+                return
+            except (OSError, subprocess.SubprocessError) as exc:
+                messagebox.showwarning(
+                    "Backup Utility Error",
+                    f"mysqldump failed. A SQL backup will be generated using MySQL Connector.\n{exc}",
+                    parent=self,
+                )
+
+        try:
+            connection = mysql.connector.connect(**DB_CONFIG)
+            cursor = connection.cursor()
+            cursor.execute("SHOW TABLES")
+            tables = [row[0] for row in cursor.fetchall()]
+
+            with open(file_path, "w", encoding="utf-8", newline="\n") as sql_file:
+                sql_file.write(
+                    "-- Asset Inventory Management System SQL Backup\n"
+                    f"-- Generated: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
+                    "SET FOREIGN_KEY_CHECKS=0;\n"
+                    "SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n\n"
+                    f"CREATE DATABASE IF NOT EXISTS `{DB_CONFIG['database']}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+                    f"USE `{DB_CONFIG['database']}`;\n"
+                )
+
+                for table in tables:
+                    cursor.execute(f"SHOW CREATE TABLE `{table}`")
+                    create_statement = cursor.fetchone()[1]
+                    sql_file.write(f"\nDROP TABLE IF EXISTS `{table}`;\n{create_statement};\n")
+
+                    cursor.execute(f"SELECT * FROM `{table}`")
+                    rows = cursor.fetchall()
+                    if rows:
+                        cursor.execute(f"SHOW COLUMNS FROM `{table}`")
+                        columns = [row[0] for row in cursor.fetchall()]
+                        column_sql = ", ".join(f"`{column}`" for column in columns)
+                        for row in rows:
+                            values = ", ".join(self.sql_dump_value(value) for value in row)
+                            sql_file.write(
+                                f"INSERT INTO `{table}` ({column_sql}) VALUES ({values});\n"
+                            )
+
+                sql_file.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
+
+            messagebox.showinfo(
+                "Export Complete",
+                f"SQL database backup created successfully:\n{file_path}",
+                parent=self,
+            )
+        except (Error, OSError, UnicodeError) as exc:
+            messagebox.showerror("Export Failed", f"Could not export SQL database.\n{exc}", parent=self)
+        finally:
+            if "cursor" in locals():
+                cursor.close()
+            if "connection" in locals() and connection.is_connected():
+                connection.close()
+
+    @staticmethod
+    def sql_dump_value(value):
+        if value is None:
+            return "NULL"
+        if isinstance(value, bytes):
+            return "0x" + value.hex().upper()
+        if isinstance(value, (int, float)):
+            return str(value)
+        escaped = str(value).replace("\\", "\\\\").replace("'", "''")
+        escaped = escaped.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+        return f"'{escaped}'"
+
+    def export_inventory_csv(self):
+        if not messagebox.askyesno("Confirm Export", "Export the inventory data to CSV?"):
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Inventory",
+            defaultextension=".csv",
+            initialfile="inventory.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        connection = None
+        cursor = None
+        try:
+            connection = mysql.connector.connect(**DB_CONFIG)
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT a.asset_id AS `ID`, a.asset_name AS `Asset Name`,
+                       c.name AS `Category`, a.status AS `Status`,
+                       a.quantity AS `Quantity`, a.brand AS `Brand`
+                FROM assets a
+                JOIN categories c ON c.category_id = a.category_id
+                WHERE a.deleted_at IS NULL
+                ORDER BY a.asset_id DESC
+                """
+            )
+            assets = cursor.fetchall()
+
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+                fieldnames = ["ID", "Asset Name", "Category", "Status", "Quantity", "Brand"]
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(assets)
+
+            messagebox.showinfo(
+                "Export Complete",
+                f"Inventory exported successfully to:\n{file_path}",
+                parent=self,
+            )
+        except (Error, OSError, csv.Error) as exc:
+            messagebox.showerror("Export Failed", f"Could not export inventory.\n{exc}", parent=self)
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None and connection.is_connected():
+                connection.close()
+
+    def import_inventory_csv(self):
+        file_path = filedialog.askopenfilename(
+            parent=self,
+            title="Import Inventory CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", newline="", encoding="utf-8-sig") as csv_file:
+                reader = csv.DictReader(csv_file)
+                if not reader.fieldnames:
+                    raise ValueError("The selected CSV file is empty.")
+
+                normalized_headers = {
+                    header.strip().lower().replace("_", " ").replace("-", " "): header
+                    for header in reader.fieldnames
+                }
+
+                def get_value(row, *names):
+                    for name in names:
+                        key = normalized_headers.get(name.lower().replace("_", " "))
+                        if key is not None and row.get(key) not in (None, ""):
+                            return str(row[key]).strip()
+                    return ""
+
+                rows = list(reader)
+        except (OSError, csv.Error, UnicodeError, ValueError) as exc:
+            messagebox.showerror("Import Failed", f"Could not read the CSV file.\n{exc}", parent=self)
+            return
+
+        if not rows:
+            messagebox.showwarning("Import Empty", "The selected CSV file has no asset rows.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Confirm Import",
+            f"Import {len(rows)} asset row(s) into inventory?",
+            parent=self,
+        ):
+            return
+
+        connection = None
+        cursor = None
+        inserted_count = 0
+        updated_count = 0
+        try:
+            connection = mysql.connector.connect(**DB_CONFIG)
+            cursor = connection.cursor(dictionary=True)
+
+            cursor.execute("SELECT user_id FROM users WHERE username = 'admin' LIMIT 1")
+            admin = cursor.fetchone()
+            admin_id = admin["user_id"] if admin else None
+
+            for row in rows:
+                asset_name = get_value(row, "asset name", "name", "asset")
+                category_name = get_value(row, "category") or "IT hardware"
+                brand = get_value(row, "brand") or "Unknown"
+                quantity_text = get_value(row, "quantity", "qty")
+                status = get_value(row, "status") or "In Stock"
+
+                if not asset_name:
+                    raise ValueError("Every row must contain an Asset Name.")
+                try:
+                    quantity = max(0, int(quantity_text or "1"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid quantity for '{asset_name}'.") from exc
+                if status not in ("In Stock", "Disposed"):
+                    status = "In Stock"
+
+                cursor.execute(
+                    "SELECT category_id FROM categories WHERE LOWER(name) = LOWER(%s) LIMIT 1",
+                    (category_name,),
+                )
+                category = cursor.fetchone()
+                if category:
+                    category_id = category["category_id"]
+                else:
+                    cursor.execute("INSERT INTO categories (name) VALUES (%s)", (category_name,))
+                    category_id = cursor.lastrowid
+
+                cursor.execute(
+                    """
+                    SELECT asset_id, quantity
+                    FROM assets
+                    WHERE asset_name = %s AND brand = %s AND category_id = %s
+                      AND deleted_at IS NULL
+                    LIMIT 1
+                    """,
+                    (asset_name, brand, category_id),
+                )
+                existing_asset = cursor.fetchone()
+                if existing_asset:
+                    cursor.execute(
+                        """
+                        UPDATE assets
+                        SET quantity = quantity + %s, status = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE asset_id = %s
+                        """,
+                        (quantity, status, existing_asset["asset_id"]),
+                    )
+                    updated_count += 1
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO assets
+                            (asset_name, brand, category_id, quantity, unit_price, status, created_by)
+                        VALUES (%s, %s, %s, %s, 0, %s, %s)
+                        """,
+                        (asset_name, brand, category_id, quantity, status, admin_id),
+                    )
+                    inserted_count += 1
+
+            cursor.execute(
+                """
+                INSERT INTO activity_logs (user_id, username, role, action, description)
+                VALUES (%s, 'admin', 'Admin', 'CREATE', %s)
+                """,
+                (admin_id, f"Imported {len(rows)} inventory rows from CSV ({inserted_count} added, {updated_count} updated)."),
+            )
+            connection.commit()
+        except (Error, ValueError) as exc:
+            if connection is not None:
+                connection.rollback()
+            messagebox.showerror("Import Failed", f"Could not import inventory.\n{exc}", parent=self)
+            return
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None and connection.is_connected():
+                connection.close()
+
+        self.load_inventory()
+        self.refresh_dashboard_data()
+        messagebox.showinfo(
+            "Import Complete",
+            f"Imported inventory successfully.\nAdded: {inserted_count}\nUpdated: {updated_count}",
+            parent=self,
+        )
 
     def validate_qty(self, P):
         if P == "" or P.isdigit():
